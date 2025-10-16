@@ -74,8 +74,7 @@ net.addLink(h1, h2,
 ```
 .
 ├── Dockerfile
-├── simple_test_linuxbridge.py    # 基本実験
-├── network_params_demo.py        # パラメータ制御デモ
+├── simple_test.py    # 基本実験
 └── README.md
 ```
 
