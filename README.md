@@ -34,10 +34,7 @@ cd workspace
 
 ```bash
 # 基本的なネットワーク実験
-python3 simple_test_linuxbridge.py
-
-# パラメータ変更のデモ
-python3 network_params_demo.py
+python3 simple_test.py
 ```
 
 ### 対話的CLI
