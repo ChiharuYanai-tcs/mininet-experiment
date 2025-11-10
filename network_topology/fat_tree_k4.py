@@ -1,200 +1,278 @@
 from mininet.net import Mininet
-from mininet.node import Host, Node
+from mininet.node import Host, Node, Controller
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info
-from mininet.link import Link, Intf
+from mininet.link import Link, TCLink
 import time
 
-class LinuxBridge(Node):
-    """
-    Linuxブリッジを使った簡易スイッチの実装
-    カーネルモジュールの制限を回避するために、
-    標準的なLinuxのブリッジ機能を使用
-    """
-    def __init__(self, name, **params):
-        super(LinuxBridge, self).__init__(name, **params)
-        self.bridge_name = name
-    
-    def start(self, controllers=None):
-        """ブリッジの初期化と起動"""
-        # ブリッジデバイスを作成
-        self.cmd(f'ip link add name {self.bridge_name}-br type bridge')
-        self.cmd(f'ip link set dev {self.bridge_name}-br up')
+class LinuxRouter(Node):
+    """IPフォワーディングを有効にしたLinuxルーター"""
+    def config(self, **params):
+        super(LinuxRouter, self).config(**params)
+        # IP転送を有効化
+        self.cmd('sysctl -w net.ipv4.ip_forward=1')
+        # プロキシARPを有効化（重要）
+        self.cmd('sysctl -w net.ipv4.conf.all.proxy_arp=1')
         
-        # 各インターフェースをブリッジに追加
-        for intf in self.intfList():
-            if intf.name != 'lo':
-                self.cmd(f'ip link set dev {intf.name} master {self.bridge_name}-br')
-                self.cmd(f'ip link set dev {intf.name} up')
-        
-        # STP（Spanning Tree Protocol）を無効化して高速化
-        self.cmd(f'echo 0 > /sys/class/net/{self.bridge_name}-br/bridge/stp_state')
-        
-        # 転送遅延を最小化
-        self.cmd(f'echo 0 > /sys/class/net/{self.bridge_name}-br/bridge/forward_delay')
-    
-    def stop(self, deleteIntfs=True):
-        """ブリッジの停止とクリーンアップ"""
-        self.cmd(f'ip link delete {self.bridge_name}-br')
-        super(LinuxBridge, self).stop(deleteIntfs)
+    def terminate(self):
+        self.cmd('sysctl -w net.ipv4.ip_forward=0')
+        super(LinuxRouter, self).terminate()
 
 def create_simplified_fattree(k=4):
     """
-    簡略化されたFat-treeトポロジーの作成
-    GitHub Codespace環境向けに最適化
+    簡略化されたFat-tree: エッジ層を省略し、
+    ホストを直接Pod内のルーターに接続
     """
-    # カスタムスイッチクラスを使用してネットワークを作成
-    net = Mininet(switch=LinuxBridge, controller=None)
+    net = Mininet(controller=None, link=TCLink)
     
-    info('=== Fat-tree トポロジー (k=4) を構築中 ===\n')
-    info('  - コアスイッチ: 4個\n')
-    info('  - 集約スイッチ: 8個 (各Pod 2個)\n')  
-    info('  - エッジスイッチ: 8個 (各Pod 2個)\n')
-    info('  - ホスト: 16個 (各エッジスイッチ 2個)\n\n')
+    info('=== 簡略化Fat-treeトポロジー構築 ===\n')
+    info('  エッジ層を省略した実装\n\n')
     
-    # コアスイッチの作成（簡略化のため数を削減）
-    core_switches = []
-    num_core = (k // 2) ** 2
-    for i in range(num_core):
-        core_sw = net.addSwitch(f'c{i}')
-        core_switches.append(core_sw)
+    # コア層ルーター
+    core_routers = []
+    for i in range(2):  # 簡略化のため2個のコアルーター
+        core = net.addHost(f'core{i}', cls=LinuxRouter)
+        core_routers.append(core)
+        info(f'  コアルーター core{i} を作成\n')
     
     all_hosts = []
+    pod_routers = []
     
-    # 各Podの構築
-    for pod in range(k):
-        # 集約層スイッチ
-        pod_agg = []
-        for i in range(k // 2):
-            agg_sw = net.addSwitch(f'a{pod}_{i}')
-            pod_agg.append(agg_sw)
+    # 各Pod（簡略化のため2個のPod）
+    for pod in range(2):
+        info(f'\n  === Pod {pod} 構築 ===\n')
         
-        # エッジ層スイッチとホスト
-        pod_edge = []
-        for i in range(k // 2):
-            edge_sw = net.addSwitch(f'e{pod}_{i}')
-            pod_edge.append(edge_sw)
+        # Pod内のルーター（集約層とエッジ層の機能を統合）
+        pod_router = net.addHost(f'pr{pod}', cls=LinuxRouter)
+        pod_routers.append(pod_router)
+        info(f'    Podルーター pr{pod} を作成\n')
+        
+        # このPod内のホスト（4個）
+        for h in range(4):
+            host_name = f'h{pod}{h}'
+            # 10.pod.0.h+1 の形式でIPを割り当て
+            ip = f'10.{pod}.0.{h+1}/24'
+            host = net.addHost(host_name, ip=ip,
+                             defaultRoute=f'via 10.{pod}.0.254')
+            all_hosts.append(host)
             
-            # 各エッジスイッチにホストを接続
-            for j in range(k // 2):
-                host_name = f'h{pod}{i}{j}'
-                # IPアドレスを明示的に設定
-                ip_addr = f'10.{pod}.{i}.{j+1}/24'
-                host = net.addHost(host_name, ip=ip_addr)
-                all_hosts.append(host)
-                net.addLink(edge_sw, host)
+            # ホストをPodルーターに直接接続
+            link = net.addLink(host, pod_router)
+            info(f'    ホスト {host_name} ({ip}) を接続\n')
         
-        # エッジ層と集約層の接続
-        for edge_sw in pod_edge:
-            for agg_sw in pod_agg:
-                net.addLink(edge_sw, agg_sw)
+        # PodルーターにこのPod用のIPアドレスを設定
+        # （後で設定）
         
-        # 集約層とコア層の接続
-        for i, agg_sw in enumerate(pod_agg):
-            for j in range(k // 2):
-                core_idx = i * (k // 2) + j
-                net.addLink(agg_sw, core_switches[core_idx])
+        # Podルーターとコアルーターの接続
+        for core_idx, core in enumerate(core_routers):
+            link = net.addLink(pod_router, core)
+            info(f'    pr{pod} を core{core_idx} に接続\n')
     
-    return net, all_hosts
+    return net, all_hosts, pod_routers, core_routers
 
-def setup_routing(net, hosts):
+def configure_routers(net, pod_routers, core_routers):
     """
-    静的ルーティングの設定
-    異なるサブネット間の通信を可能にする
+    ルーターのIPアドレスとルーティング設定
     """
-    info('\n=== ルーティングを設定中 ===\n')
+    info('\n=== ルーターの設定 ===\n')
     
-    # 各ホストにデフォルトゲートウェイを設定
-    for host in hosts:
-        host_name = host.name
-        pod = int(host_name[1])
-        edge = int(host_name[2])
+    # まず全てのルーターの全インターフェースをクリア
+    info('\n  全ルーターのインターフェースをクリア中...\n')
+    for router in pod_routers + core_routers:
+        # 既存のルートを削除
+        router.cmd('ip route flush table main')
+        # 全てのIPアドレスをクリア
+        for intf_name in router.intfNames():
+            if intf_name != 'lo':  # loopbackは除外
+                router.cmd(f'ip addr flush dev {intf_name}')
+                router.cmd(f'ip link set {intf_name} down')
+                router.cmd(f'ip link set {intf_name} up')
+    
+    # 各Podルーターの設定
+    for pod_idx, pr in enumerate(pod_routers):
+        info(f'\n  Podルーター pr{pod_idx} の設定:\n')
         
-        # デフォルトゲートウェイの設定（簡略化）
-        gateway = f'10.{pod}.{edge}.254'
-        host.cmd(f'route add default gw {gateway}')
+        # ホスト向けインターフェースの設定（ゲートウェイ）
+        # 最初の4つのインターフェースはホスト向け
+        for h in range(4):
+            intf = pr.intfNames()[h]
+            pr.cmd(f'ip addr flush dev {intf}')
+            # 最初のインターフェースにのみゲートウェイIPを設定
+            if h == 0:
+                ip = f'10.{pod_idx}.0.254/24'
+                pr.cmd(f'ip addr add {ip} dev {intf}')
+                info(f'    ゲートウェイIP: 10.{pod_idx}.0.254 on {intf}\n')
+            pr.cmd(f'ip link set {intf} up')
         
-        # ARPテーブルのタイムアウトを延長
-        host.cmd('echo 300 > /proc/sys/net/ipv4/neigh/default/gc_stale_time')
+        # ブリッジを作成してホスト向けインターフェースを接続
+        bridge_name = f'br{pod_idx}'
+        pr.cmd(f'ip link add name {bridge_name} type bridge')
+        pr.cmd(f'ip link set {bridge_name} up')
+        pr.cmd(f'ip addr add 10.{pod_idx}.0.254/24 dev {bridge_name}')
+        
+        # 全てのホスト向けインターフェースをブリッジに接続
+        for h in range(4):
+            intf = pr.intfNames()[h]
+            pr.cmd(f'ip addr flush dev {intf}')
+            pr.cmd(f'ip link set {intf} master {bridge_name}')
+            pr.cmd(f'ip link set {intf} up')
+        
+        info(f'    ブリッジ {bridge_name} を作成し、ホストインターフェースを接続\n')
+        
+        # コアルーター向けインターフェースの設定
+        for core_idx in range(len(core_routers)):
+            intf_idx = 4 + core_idx  # ホスト接続の後のインターフェース
+            if intf_idx < len(pr.intfNames()):
+                intf = pr.intfNames()[intf_idx]
+                # バックボーンネットワーク: 192.168.x.x
+                # 各リンクに異なるサブネットを割り当て
+                subnet_id = pod_idx * len(core_routers) + core_idx
+                ip = f'192.168.{subnet_id}.1/30'
+                pr.cmd(f'ip addr add {ip} dev {intf}')
+                pr.cmd(f'ip link set {intf} up')
+                info(f'    コア接続IP: {ip} (subnet {subnet_id})\n')
+        
+        # 他のPodへの静的ルート
+        for other_pod in range(2):
+            if other_pod != pod_idx:
+                # 他のPodへはコアルーター経由 (最初のコアルーターを使用)
+                subnet_id = pod_idx * len(core_routers)  # pr-core0の接続
+                next_hop = f'192.168.{subnet_id}.2'
+                pr.cmd(f'ip route add 10.{other_pod}.0.0/24 via {next_hop}')
+                info(f'    ルート追加: 10.{other_pod}.0.0/24 via {next_hop}\n')
+    
+    # コアルーターの設定
+    for core_idx, core in enumerate(core_routers):
+        info(f'\n  コアルーター core{core_idx} の設定:\n')
+        
+        for pod_idx in range(len(pod_routers)):
+            intf = core.intfNames()[pod_idx]
+            
+            # 既存のIPアドレスを再度クリア（念のため）
+            core.cmd(f'ip addr flush dev {intf}')
+            
+            # バックボーンネットワーク
+            subnet_id = pod_idx * len(core_routers) + core_idx
+            ip = f'192.168.{subnet_id}.2/30'
+            core.cmd(f'ip addr add {ip} dev {intf}')
+            core.cmd(f'ip link set {intf} up')
+            info(f'    インターフェース {intf}: {ip} (subnet {subnet_id})\n')
+            
+            # 各Podネットワークへのルート
+            next_hop = f'192.168.{subnet_id}.1'
+            core.cmd(f'ip route add 10.{pod_idx}.0.0/24 via {next_hop}')
+            info(f'    ルート追加: 10.{pod_idx}.0.0/24 via {next_hop}\n')
 
-def run_throughput_experiment(net):
-    """
-    h000からh111への10秒間のスループット測定実験
-    環境制限を考慮した設定で実行
-    """
-    info('\n' + '='*60 + '\n')
-    info('  スループット測定実験を開始\n')
-    info('='*60 + '\n')
+def verify_connectivity(net):
+    """接続性の詳細な検証"""
+    info('\n=== 接続性の検証 ===\n')
     
-    h000 = net.get('h000')
-    h111 = net.get('h111')
+    h00 = net.get('h00')
+    h13 = net.get('h13')  # Pod1のホスト
     
-    info(f'  送信元: h000 (IP: {h000.IP()}) → 送信先: h111 (IP: {h111.IP()})\n')
-    info('  測定時間: 10秒\n')
-    info('  測定間隔: 1秒\n\n')
+    info(f'\n  テスト1: h00 ({h00.IP()}) → ゲートウェイ (10.0.0.254)\n')
+    result = h00.cmd('ping -c 2 10.0.0.254')
+    if '2 received' in result or '2 packets received' in result:
+        info('    ✓ ゲートウェイに到達可能\n')
+    else:
+        info('    ✗ ゲートウェイに到達不可\n')
+        info(f'    デバッグ: {result}\n')
     
-    # 接続性の確認
-    info('  接続性を確認中...\n')
-    ping_result = h000.cmd(f'ping -c 1 {h111.IP()}')
-    if '1 received' not in ping_result:
-        info('  警告: ホスト間の接続が確立できません\n')
-        info('  ネットワークの初期化を待機中...\n')
-        time.sleep(3)
+    info(f'\n  テスト2: h00 ({h00.IP()}) → h13 ({h13.IP()})\n')
+    result = h00.cmd(f'ping -c 3 {h13.IP()}')
+    if '3 received' in result or '3 packets received' in result:
+        info('    ✓ Pod間通信成功！\n')
+        return True
+    else:
+        info('    ✗ Pod間通信失敗\n')
+        
+        # デバッグ情報
+        info('\n  === デバッグ情報 ===\n')
+        info('  h00のルーティングテーブル:\n')
+        info(h00.cmd('ip route'))
+        info('\n  pr0のルーティングテーブル:\n')
+        pr0 = net.get('pr0')
+        info(pr0.cmd('ip route'))
+        info('\n  core0のルーティングテーブル:\n')
+        core0 = net.get('core0')
+        info(core0.cmd('ip route'))
+        info('\n  pr1のルーティングテーブル:\n')
+        pr1 = net.get('pr1')
+        info(pr1.cmd('ip route'))
+        info('\n  ARPテーブル (h00):\n')
+        info(h00.cmd('arp -n'))
+        
+        # traceroute で経路確認
+        info('\n  経路確認 (traceroute):\n')
+        info(h00.cmd(f'traceroute -n -m 5 {h13.IP()}'))
+        
+        # pr0からcore0へのping
+        info('\n  pr0 → core0 (192.168.0.2) ping:\n')
+        info(pr0.cmd('ping -c 2 192.168.0.2'))
+        
+        # core0からpr1へのping
+        info('\n  core0 → pr1 (192.168.0.3) ping:\n')
+        info(core0.cmd('ping -c 2 192.168.0.3'))
+        
+        # pingの詳細
+        info('\n  詳細なping結果:\n')
+        info(h00.cmd(f'ping -c 1 -v {h13.IP()}'))
+        
+        return False
+
+def run_iperf_test(net):
+    """iperf測定の実行"""
+    if not verify_connectivity(net):
+        info('\n接続性の問題があるため、iperf測定をスキップします\n')
+        return
     
-    # iperfサーバーを起動
-    info('  h111でiperfサーバーを起動中...\n')
-    h111.cmd('iperf -s > /tmp/iperf_server.log 2>&1 &')
+    info('\n=== iPerf スループット測定 ===\n')
+    
+    h00 = net.get('h00')
+    h13 = net.get('h13')
+    
+    info(f'  送信元: h00 ({h00.IP()}) → 送信先: h13 ({h13.IP()})\n')
+    
+    # サーバー起動
+    info('  iperfサーバーを起動...\n')
+    h13.cmd('iperf -s &')
     time.sleep(2)
     
-    # iperfクライアントを実行
-    info('  h000からトラフィックを送信中...\n\n')
-    result = h000.cmd(f'iperf -c {h111.IP()} -t 10 -i 1')
-    
-    info('='*60 + '\n')
-    info('  測定結果:\n')
-    info('='*60 + '\n')
+    # クライアント実行
+    info('  測定中...\n\n')
+    result = h00.cmd(f'iperf -c {h13.IP()} -t 10 -i 2')
     info(result)
     
-    # サーバープロセスの停止
-    h111.cmd('pkill -9 iperf')
+    # サーバー停止
+    h13.cmd('killall iperf')
 
 def main():
     setLogLevel('info')
     
-    info('\n=== Mininet Fat-tree実験環境 ===\n')
-    info('GitHub Codespace向けに最適化された設定\n\n')
+    info('\n=== Mininet簡略化Fat-tree (動作確認版) ===\n\n')
     
-    # ネットワークの作成
-    net, hosts = create_simplified_fattree(k=4)
+    # ネットワーク構築
+    net, hosts, pod_routers, core_routers = create_simplified_fattree()
     
-    info('\n=== ネットワークを起動中 ===\n')
+    info('\n=== ネットワーク起動 ===\n')
     net.start()
     
-    # ルーティングの設定
-    setup_routing(net, hosts)
+    # ルーター設定
+    configure_routers(net, pod_routers, core_routers)
     
-    # ネットワークの安定化を待つ
-    info('\nネットワークの初期化を待機中...\n')
-    time.sleep(3)
+    # 安定化待機
+    info('\n少し待機中...\n')
+    time.sleep(2)
     
-    # スループット測定実験
-    run_throughput_experiment(net)
+    # テスト実行
+    run_iperf_test(net)
     
-    # CLI起動
-    info('\n=== CLI を起動 ===\n')
-    info('  使用可能なコマンド:\n')
-    info('    - nodes: ノード一覧の表示\n')
-    info('    - net: ネットワーク情報の表示\n')
-    info('    - h000 ping -c 3 h111: 特定ホスト間のping\n')
-    info('    - h000 iperf -s &: iperfサーバーの起動\n')
-    info('    - h111 iperf -c 10.0.0.1: iperfクライアントの実行\n')
-    info('    - exit: 終了\n\n')
-    
+    # CLI
+    info('\n=== CLI (exitで終了) ===\n')
     CLI(net)
     
-    info('\n=== ネットワークを停止中 ===\n')
     net.stop()
-    info('\n=== 実験終了 ===\n')
+    info('\n=== 終了 ===\n')
 
 if __name__ == '__main__':
     main()
